@@ -66,6 +66,13 @@ def build() -> tuple[mujoco.MjModel, mujoco.MjData]:
   # soft, grippy sponge against soft TPU jaws: high friction, compliant contact
   sp.add_geom(name="sponge", type=mujoco.mjtGeom.mjGEOM_BOX, size=SPONGE / 2, rgba=[0.95, 0.85, 0.15, 1], mass=0.015,
               friction=[1.6, 0.02, 0.002], condim=4, solref=[0.02, 1], solimp=[0.9, 0.95, 0.005, 0.5, 2])
+  # Grasp attach (off until a grasp is confirmed): a weld from each fixed jaw to the sponge. MuJoCo bodies are rigid, so a rigid box
+  # between thin rigid jaw pads only touches at edges and is easily wedged out, unlike a real sponge squashed by soft TPU jaws.
+  # The weld stands in for that squashed, area-contact grip, so the task sequence (reach, handover, place) can be checked.
+  for arm, jaw_body in (("left", "Fixed_Jaw_2"), ("right", "Fixed_Jaw")):
+    e = spec.add_equality()
+    e.name, e.type, e.objtype = f"grasp_{arm}", mujoco.mjtEq.mjEQ_WELD, mujoco.mjtObj.mjOBJ_BODY
+    e.name1, e.name2, e.active = jaw_body, "sponge", False
   model = spec.compile()
   return model, mujoco.MjData(model)
 
@@ -150,7 +157,14 @@ def main() -> None:
   ap.add_argument("--out", default="handover.mp4")
   ap.add_argument("--fps", type=int, default=30)
   ap.add_argument("--truth", action="store_true", help="use the true sponge position instead of the head-camera estimate")
+  ap.add_argument("--debug", action="store_true", help="log jaw pad positions relative to the sponge at the handover")
+  ap.add_argument("--sponge-width", type=float, default=None, help="override the sponge width (m), e.g. 0.03 for a half sponge")
+  ap.add_argument("--export", default=None, help="write the motion plan (arm joint targets in sim radians, jaw actions) to this JSON")
   a = ap.parse_args()
+  if a.sponge_width:
+    global SPONGE, GRASP_HALF
+    SPONGE = np.array([SPONGE[0], a.sponge_width, SPONGE[2]])
+    GRASP_HALF = 0.006 + 0.005 + SPONGE[1] / 2
   model, data = build()
   arms = Arms(model)
   act = {(arm, n): model.actuator(f"{arm}_arm_{n}").id for arm in ARM_JOINTS for n in ARM_ACT + ["gripper"]}
@@ -161,6 +175,8 @@ def main() -> None:
   overview.lookat[:] = [0.2, 0, 0.82]; overview.distance, overview.azimuth, overview.elevation = 1.15, 150, -30
   spf = int(round(1 / (a.fps * model.opt.timestep)))
   log: list[str] = []
+  plan: list[dict] = []          # exported motion plan for the real robot
+  last_label = {"right": "", "left": ""}
 
   def frame() -> None:
     tiles = []
@@ -178,6 +194,8 @@ def main() -> None:
       frame()
 
   def move(arm: str, q_goal: np.ndarray, seconds: float) -> None:
+    plan.append({"arm": arm, "move": [float(v) for v in q_goal], "seconds": seconds, "label": last_label[arm] or "park"})
+    last_label[arm] = ""
     q0 = np.array([data.ctrl[act[(arm, k)]] for k in ARM_ACT])
     steps = int(seconds * a.fps)
     for i in range(1, steps + 1):
@@ -188,9 +206,42 @@ def main() -> None:
         mujoco.mj_step(model, data)
       frame()
 
+  pads = {arm: {model.geom(f"fixed_jaw_tip{suf}_pad").id, model.geom(f"moving_jaw_tip{suf}_pad").id}
+          for arm, suf in (("right", ""), ("left", "_2"))}
+  sponge_geom = model.geom("sponge").id
+
+  def touching(arm: str) -> set[int]:
+    return {int(c.geom1 if c.geom2 == sponge_geom else c.geom2) for c in data.contact[:data.ncon]
+            if sponge_geom in (c.geom1, c.geom2)} & pads[arm]
+
+  def attach(arm: str) -> None:
+    """Weld the sponge to the fixed jaw at their current relative pose (relpose = sponge pose in the jaw frame)."""
+    eid = model.equality(f"grasp_{arm}").id
+    b1, b2 = model.eq_obj1id[eid], model.eq_obj2id[eid]
+    q1inv = np.zeros(4); mujoco.mju_negQuat(q1inv, data.xquat[b1])
+    qrel = np.zeros(4); mujoco.mju_mulQuat(qrel, q1inv, data.xquat[b2])
+    model.eq_data[eid, 0:3] = 0
+    model.eq_data[eid, 3:6] = data.xmat[b1].reshape(3, 3).T @ (data.xpos[b2] - data.xpos[b1])
+    model.eq_data[eid, 6:10] = qrel
+    model.eq_data[eid, 10] = 1.0
+    data.eq_active[eid] = 1
+
   def jaw(arm: str, value: float, seconds: float = 0.6) -> None:
+    eid = model.equality(f"grasp_{arm}").id
+    opening = value > data.ctrl[act[(arm, "gripper")]]
+    if opening and data.eq_active[eid]:
+      data.eq_active[eid] = 0
+      log.append(f"{arm:5s} releases the sponge")
+    plan.append({"arm": arm, "jaw": "open" if opening else "close", "sim_rad": value})
     data.ctrl[act[(arm, "gripper")]] = value
     run(seconds)
+    if not opening:
+      t = touching(arm)
+      if len(t) == 2:
+        attach(arm)
+        log.append(f"{arm:5s} grasp confirmed (both jaw pads touch the sponge): attached")
+      else:
+        log.append(f"{arm:5s} grasp MISSED: {len(t)} of 2 jaw pads touch the sponge, not attached")
 
   def ik(arm: str, xyz, axis_des, close_des, label: str) -> np.ndarray:
     """Best of several seeds: the commanded pose, and generic reaching poses with the wrist rolled either way."""
@@ -206,8 +257,24 @@ def main() -> None:
       if best is None or score < best[0]:
         best = (score, res)
     q, perr, aerr, cerr = best[1]
+    last_label[arm] = label
     log.append(f"{arm:5s} {label:9s} -> {np.round(xyz, 3)}: pos err {perr * 1000:4.1f} mm, axis {aerr:4.1f} deg, jaws {cerr:4.1f} deg")
     return q
+
+  def line(arm: str, start, end, axis_des, close_des, label: str, seconds: float, n: int = 8) -> None:
+    """Straight-line tool move: IK at n points, each seeded from the previous one, so the arm stays on one IK solution
+    (separate solves for the two ends can land on different elbow/wrist solutions and sweep the arm through the object)."""
+    start, end = np.asarray(start, float), np.asarray(end, float)
+    cur = np.array([data.ctrl[act[(arm, k)]] for k in ARM_ACT])
+    for k in range(1, n + 1):
+      p = start + (end - start) * k / n
+      seed = data.qpos.copy(); seed[arms.qadr[arm]] = cur
+      q, perr, aerr, cerr = arms.solve(arm, seed, p, np.asarray(axis_des, float), np.asarray(close_des, float))
+      if k == n:
+        log.append(f"{arm:5s} {label:9s} -> {np.round(end, 3)}: pos err {perr * 1000:4.1f} mm, axis {aerr:4.1f} deg, jaws {cerr:4.1f} deg (line, {n} pts)")
+      cur = q
+      last_label[arm] = f"{label} {k}/{n}"
+      move(arm, q, seconds / n)
 
   def sponge_state() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """sponge centre, long axis, width axis (world)"""
@@ -252,15 +319,16 @@ def main() -> None:
   jaw("left", JAW_OPEN)
   down, side = grasp_dirs("left", pick, TILT, sideways=True)   # jaws close across the sponge's width
   move("left", ik("left", pick + [0, 0, 0.07], down, side, "hover"), 1.8)
-  move("left", ik("left", pick, down, side, "grasp"), 1.0)
+  line("left", pick + [0, 0, 0.07], pick, down, side, "descend", 1.2)
   jaw("left", JAW_CLOSED, 0.8)
-  move("left", ik("left", pick + [0, 0, 0.07], down, side, "lift"), 1.0)
+  line("left", pick, pick + [0, 0, 0.10], down, side, "lift", 1.2)
   log.append(f"after lift: sponge at {data.body('sponge').xpos.round(3)} (lifted if z > {zg + 0.03:.2f})")
 
   # 2. present: roll back so the jaws close in the vertical plane; the sponge's free end swings toward the right arm
   hand = np.array([0.25, 0.04, DESK_Z + 0.10])
   axis_h, close_h = grasp_dirs("left", hand, 40.0, sideways=False)   # rolled back: jaws close in the arm's vertical plane
-  move("left", ik("left", hand, axis_h, close_h, "present"), 2.0)
+  move("left", ik("left", hand + [0, 0, 0.05], axis_h, close_h, "raise"), 1.6)
+  line("left", hand + [0, 0, 0.05], hand, axis_h, close_h, "present", 0.8, 4)
   run(0.5)
   c, long_ax, width_ax = sponge_state()
   ends = [c + long_ax * (SPONGE[0] / 2 - EDGE_IN), c - long_ax * (SPONGE[0] / 2 - EDGE_IN)]
@@ -269,10 +337,23 @@ def main() -> None:
   log.append(f"presented: sponge at {c.round(3)}, long axis {long_ax.round(2)}, free end {take.round(3)}")
 
   # 3. right grabs the free end across the width, left lets go and backs off
-  axis_r, _ = grasp_dirs("right", take, 40.0, sideways=False)
+  # Same grasp geometry as the left's desk grasp, but in the sponge's own frame: gripper axis tilted TILT from the sponge's face,
+  # pointing along it toward the middle, jaws closing across the width. Then the moving jaw meets the side, not the top.
+  # The right arm grips at its own natural angle (axis along its heading, jaws across it). The two arms' headings differ by ~45 deg
+  # at any shared point, so this grasp is skewed to the sponge: it only closes on objects whose diagonal fits the jaw opening.
+  axis_r, close_r = grasp_dirs("right", take, TILT, sideways=True)
   jaw("right", JAW_OPEN)
-  move("right", ik("right", take + [0, -0.04, 0.05], axis_r, width_ax, "approach"), 1.8)
-  move("right", ik("right", take, axis_r, width_ax, "take"), 1.0)
+  move("right", ik("right", take - 0.05 * axis_r, axis_r, close_r, "approach"), 1.8)
+  line("right", take - 0.05 * axis_r, take, axis_r, close_r, "take", 1.2)
+  if a.debug:
+    arms.d.qpos[:] = data.qpos; mujoco.mj_forward(model, arms.d)
+    c, long_ax, width_ax2 = sponge_state()
+    for g in ("fixed_jaw_tip_pad", "moving_jaw_tip_pad"):
+      gid = model.geom(g).id; gc = data.geom_xpos[gid]; R = data.geom_xmat[gid].reshape(3, 3); hs = model.geom_size[gid]
+      along = lambda v: (gc - c) @ v
+      ext = sum(abs(R[:, k] @ width_ax2) * hs[k] for k in range(3))
+      log.append(f"   debug {g:20s}: across width {along(width_ax2) * 1000:+6.1f} mm (faces {(along(width_ax2) - ext) * 1000:+.1f}..{(along(width_ax2) + ext) * 1000:+.1f}; "
+                 f"sponge sides +-30), along length {along(long_ax) * 1000:+6.1f} mm, along thickness {along(np.cross(long_ax, width_ax2)) * 1000:+6.1f} mm (sponge +-10)")
   jaw("right", JAW_CLOSED, 0.8)
   jaw("left", JAW_OPEN, 0.6)
   move("left", ik("left", hand + [-0.05, 0.05, 0.06], axis_h, close_h, "release"), 1.0)
@@ -283,13 +364,18 @@ def main() -> None:
   place = np.array([PLACE_XY[0] - SPONGE[0] / 2 + EDGE_IN, PLACE_XY[1], zg + 0.004])
   down_r, side_r = grasp_dirs("right", place, TILT, sideways=True)
   move("right", ik("right", place + [0, 0, 0.07], down_r, side_r, "carry"), 1.8)
-  move("right", ik("right", place, down_r, side_r, "set down"), 1.0)
+  line("right", place + [0, 0, 0.07], place, down_r, side_r, "set down", 1.2)
   jaw("right", JAW_OPEN, 0.6)
-  move("right", ik("right", place + [0, 0, 0.08], down_r, side_r, "back off"), 1.0)
+  line("right", place, place + [0, 0, 0.08], down_r, side_r, "back off", 1.0)
   move("right", FOLDED, 1.4)
   run(0.6)
   writer.release()
 
+  if a.export:
+    import json
+    Path(a.export).write_text(json.dumps({"joint_order": ARM_ACT, "units": "sim radians (MakerMods URDF)", "sponge_xy": list(map(float, xy)),
+                                          "steps": plan}, indent=1))
+    log.append(f"exported {len(plan)} steps to {a.export}")
   c, long_ax, _ = sponge_state()
   for line in log:
     print(line)
