@@ -38,6 +38,7 @@ HEAD_PAN_MASS = 0.15  # kg: neck-top servo bracket + tilt servo
 HEAD_TILT_MASS = 0.20  # kg: head camera, case, mount
 CAMERA_FOVY = {"head_camera": 100.0, "wrist_camera_right": 100.0, "wrist_camera_left": 100.0}  # deg vertical: Innomaker 1080p 130 deg diagonal, 4:3 pinhole equivalent
 
+GRIPPER_FORCE = 0.5  # N m: load-limited squeeze, as on the real arms (STS3215 stall ~3 N m)
 ARMS = {"right": "", "left": "_2"}  # URDF joint suffix per arm (the right arm carries Right_Arm_Camera)
 ARM_JOINTS = ["Rotation", "Pitch", "Elbow", "Wrist_Pitch", "Wrist_Roll", "Jaw"]
 LEROBOT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
@@ -64,6 +65,46 @@ def scale_mass(body: ET.Element, mass: float) -> None:
     if inertial.get(key):
       vals = np.array([float(v) for v in inertial.get(key).split()]) * (mass / old)
       inertial.set(key, " ".join(f"{v:.6g}" for v in vals))
+
+
+JAW_PAD = (0.012, 0.009, 0.003)  # half sizes: along the gripper axis, along the hinge, along the closing direction (m)
+PAD_PARALLEL_AT = 0.9  # rad: jaw opening at which the two pads are parallel (~6 cm objects). Away from it they form a wedge, which
+                       # rigid sim pads turn into a squeeze-out; the real soft TPU jaws conform instead.
+
+
+def add_jaw_pads(root: ET.Element, bodies: dict) -> None:
+  tmp = HERE / "_pads.xml"
+  tmp.write_text(ET.tostring(root, encoding="unicode"))
+  model = mujoco.MjModel.from_xml_path(str(tmp))
+  tmp.unlink()
+  data = mujoco.MjData(model)
+  for suf in ARMS.values():
+    data.qpos[model.jnt_qposadr[model.joint("Jaw" + suf).id]] = PAD_PARALLEL_AT  # pads end up parallel at this opening
+  mujoco.mj_forward(model, data)
+  for suf in ARMS.values():
+    axis = data.xaxis[model.joint("Wrist_Roll" + suf).id]; axis = axis / np.linalg.norm(axis)
+    hinge = data.xaxis[model.joint("Jaw" + suf).id]; hinge = hinge / np.linalg.norm(hinge)
+    f, mv = data.body("Fixed_Jaw_tip" + suf).xpos, data.body("Moving_Jaw_tip" + suf).xpos
+    for tip, other, sign in (("Fixed_Jaw_tip", mv, 1), ("Moving_Jaw_tip", f, 1)):
+      b = model.body(tip + suf).id
+      p_tip = data.xpos[b]
+      n = np.cross(axis, hinge); n = n / np.linalg.norm(n)
+      if (other - p_tip) @ n < 0:
+        n = -n  # n points from this jaw toward the other one
+      if tip.startswith("Moving"):
+        ax_m = data.xmat[b].reshape(3, 3)  # the moving jaw's own axes follow its rotation
+        ax_w = ax_m @ (data.xmat[model.body("Fixed_Jaw_tip" + suf).id].reshape(3, 3).T @ axis)
+      else:
+        ax_w = axis
+      centre = p_tip - JAW_PAD[0] * ax_w + JAW_PAD[2] * n
+      R_w = np.column_stack([ax_w, np.cross(n, ax_w), n])
+      R_b = data.xmat[b].reshape(3, 3).T @ R_w
+      q = np.zeros(4); mujoco.mju_mat2Quat(q, R_b.ravel())
+      pos_b = data.xmat[b].reshape(3, 3).T @ (centre - p_tip)
+      ET.SubElement(bodies[tip + suf], "geom", {"name": f"{tip.lower()}{suf}_pad", "type": "box",
+                                               "size": " ".join(f"{v}" for v in JAW_PAD), "pos": " ".join(f"{v:.5f}" for v in pos_b),
+                                               "quat": " ".join(f"{v:.5f}" for v in q), "rgba": "0.1 0.1 0.1 1", "group": "3",
+                                               "friction": "2.0 0.02 0.002", "condim": "4"})  # soft TPU
 
 
 def main() -> None:
@@ -131,6 +172,10 @@ def main() -> None:
     ET.SubElement(bodies["base_link"], "geom", {"name": f"basket_{i}_floor", "type": "box", "size": f"{sx} {sy} 0.004",
                                                 "pos": f"{BASKET_X} 0 {z}", "rgba": "0 0 0 0", "group": "3"})
 
+  # jaw contact pads: the package's jaw collision meshes are the broken .ply files, so the jaws would grip nothing. Thin boxes on
+  # the inner face of each jaw tip, oriented from the jaw frames: long along the gripper axis, thin along the closing direction.
+  add_jaw_pads(root, bodies)
+
   # cameras (MuJoCo cameras look along -z with +y up)
   def add_camera(body_name: str, cam: str, quat: str) -> None:
     ET.SubElement(bodies[body_name], "camera", {"name": cam, "mode": "fixed", "quat": quat, "fovy": f"{CAMERA_FOVY[cam]}"})
@@ -149,7 +194,12 @@ def main() -> None:
   for arm, suf in ARMS.items():
     for jn, ln in zip(ARM_JOINTS, LEROBOT_NAMES):
       rng = next(j for j in root.iter("joint") if j.get("name") == jn + suf).get("range")
-      ET.SubElement(act, "position", {"class": "sts3215", "name": f"{arm}_arm_{ln}", "joint": jn + suf, "ctrlrange": rng})
+      attrs = {"class": "sts3215", "name": f"{arm}_arm_{ln}", "joint": jn + suf, "ctrlrange": rng}
+      if ln == "gripper":
+        # The real grippers squeeze by load (~10-15 % of the servo's torque), not at full force: a full-force pinch with the angled
+        # jaws wedges objects out of the grip.
+        attrs["forcerange"] = f"-{GRIPPER_FORCE} {GRIPPER_FORCE}"
+      ET.SubElement(act, "position", attrs)
   for jn, an in zip(HEAD_JOINTS, ("head_motor_1", "head_motor_2")):
     rng = next(j for j in root.iter("joint") if j.get("name") == jn).get("range")
     ET.SubElement(act, "position", {"class": "sts3215", "name": an, "joint": jn, "ctrlrange": rng})
