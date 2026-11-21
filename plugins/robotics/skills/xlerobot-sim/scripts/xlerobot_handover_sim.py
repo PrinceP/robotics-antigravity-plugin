@@ -56,8 +56,13 @@ def tilted(deg: float, heading: np.ndarray = np.array([1.0, 0, 0])) -> np.ndarra
   return np.array([h[0] * np.cos(np.radians(deg)), h[1] * np.cos(np.radians(deg)), -np.sin(np.radians(deg))])
 
 
+ARM_RAISE = 0.0   # m: raise both arm mounts above MakerMods' model (our robot: base bottoms at 0.86 m vs 0.744 m -> 0.116)
+
+
 def build() -> tuple[mujoco.MjModel, mujoco.MjData]:
   spec = mujoco.MjSpec.from_file(str(SCENE))
+  for base in ("Base", "Base_2"):  # arm base bodies (children of the cart); everything on the arms, wrist cameras included, follows
+    spec.body(base).pos[2] += ARM_RAISE
   desk = spec.worldbody.add_body(name="desk", pos=[DESK_FRONT_X + 0.25, 0, DESK_Z - 0.015])
   desk.add_geom(name="desk_top", type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.25, 0.55, 0.015], rgba=[0.45, 0.28, 0.15, 1],
                 friction=[0.8, 0.01, 0.001])
@@ -159,8 +164,12 @@ def main() -> None:
   ap.add_argument("--truth", action="store_true", help="use the true sponge position instead of the head-camera estimate")
   ap.add_argument("--debug", action="store_true", help="log jaw pad positions relative to the sponge at the handover")
   ap.add_argument("--sponge-width", type=float, default=None, help="override the sponge width (m), e.g. 0.03 for a half sponge")
+  ap.add_argument("--arm-raise", type=float, default=0.0,
+                  help="raise both arm mounts by this much (m) to match a build: base bottom height on the robot minus 0.744 m")
   ap.add_argument("--export", default=None, help="write the motion plan (arm joint targets in sim radians, jaw actions) to this JSON")
   a = ap.parse_args()
+  global ARM_RAISE
+  ARM_RAISE = a.arm_raise
   if a.sponge_width:
     global SPONGE, GRASP_HALF
     SPONGE = np.array([SPONGE[0], a.sponge_width, SPONGE[2]])

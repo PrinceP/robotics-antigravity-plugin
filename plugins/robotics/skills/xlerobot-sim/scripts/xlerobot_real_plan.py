@@ -34,7 +34,7 @@ GRIPPER_SPAN_RAD = 2.25            # calibrated gripper travel (~129 deg) -> 0..
 ARMS = {"left": {"port": "/dev/ttyACM0", "id": "xlerobot_left", "cam": "/dev/v4l/by-path/platform-3610000.usb-usb-0:2.4:1.0-video-index0"},
         "right": {"port": "/dev/ttyACM1", "id": "xlerobot_right", "cam": "/dev/v4l/by-path/platform-3610000.usb-usb-0:2.2:1.0-video-index0"}}
 HEAD_CAM = "/dev/v4l/by-path/platform-3610000.usb-usb-0:2.1:1.0-video-index0"
-CHECKPOINTS = ("ready", "hover", "present", "approach", "carry")
+CHECKPOINTS = ("ready", "hover", "descend", "present", "approach", "take", "carry")  # pause after the last point of each (before contact)
 
 
 def sim_to_real_deg(q_sim) -> np.ndarray:
@@ -96,6 +96,7 @@ def main():
   ap.add_argument("--max-temp", type=int, default=65)
   ap.add_argument("--no-pause", action="store_true", help="do not stop at checkpoints")
   ap.add_argument("--logdir", default="logs")
+  ap.add_argument("--from-step", type=int, default=0, help="start at this plan step (earlier jaw actions are replayed as their final state)")
   a = ap.parse_args()
   plan = json.loads(Path(a.plan).read_text())
   steps = plan["steps"]
@@ -183,12 +184,18 @@ def main():
     raw = b.read("Present_Position", "gripper", normalize=False)
     rmin = b.calibration["gripper"].range_min
     load = lambda: b.read("Present_Load", "gripper", normalize=False) & 0x3FF
-    sq = 0
+    # contact = load high AND the jaw has stopped moving: the load also spikes just from starting to move
+    sq, prev, stalls = 0, raw, 0
     while raw - sq > rmin + 5:
       sq += 6
       b.write("Goal_Position", "gripper", int(raw - sq), normalize=False)
-      time.sleep(0.06)
-      if load() >= a.grip_load:
+      time.sleep(0.08)
+      pos = b.read("Present_Position", "gripper", normalize=False)
+      stalls = stalls + 1 if (load() >= a.grip_load and prev - pos <= 2) else 0
+      prev = pos
+      if stalls >= 2:
+        sq = raw - pos + 6  # hold just past where the jaw stopped: a steady squeeze, not a stall at full force
+        b.write("Goal_Position", "gripper", int(raw - sq), normalize=False)
         break
     time.sleep(0.3)
     print(f"   {arm} gripper: closed {sq * 360 / 4096:.0f} deg, load {load() / 10:.0f} %")
@@ -208,6 +215,8 @@ def main():
     if not pause("ready", "both"):
       return
     for i, s in enumerate(steps):
+      if i < a.from_step:
+        continue
       if not temps_ok():
         break
       arm = s["arm"]
