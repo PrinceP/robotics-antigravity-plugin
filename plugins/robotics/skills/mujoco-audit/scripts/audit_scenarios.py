@@ -1683,11 +1683,21 @@ def run_scenario_2_tilt_table(
       _attach_all_child_bodies(carrier, child_spec, "obj_")
 
     model, data = build_attached_scene_model(xml_path, _setup)
-    q_adr = int(model.jnt_qposadr[1])
+    tilt_jid = mujoco.mj_name2id(
+        model, int(mujoco.mjtObj.mjOBJ_JOINT), "scenario_tilt_hinge"
+    )
+    tilt_qadr = int(model.jnt_qposadr[tilt_jid])
+    tilt_act_id = mujoco.mj_name2id(
+        model, int(mujoco.mjtObj.mjOBJ_ACTUATOR), "scenario_tilt_act"
+    )
+    carrier_jid = mujoco.mj_name2id(
+        model, int(mujoco.mjtObj.mjOBJ_JOINT), "carrier_free"
+    )
+    q_adr = int(model.jnt_qposadr[carrier_jid])
     data.qpos[q_adr + 3 : q_adr + 7] = yaw_quat
     mujoco.mj_forward(model, data)
     for _ in range(150):
-      data.ctrl[0] = 0.0
+      data.ctrl[tilt_act_id] = 0.0
       mujoco.mj_step(model, data)
 
     table_id = mujoco.mj_name2id(
@@ -1721,9 +1731,9 @@ def run_scenario_2_tilt_table(
 
     for step in range(total_steps):
       target_rad = math.radians(max_angle_deg) * (step / total_steps)
-      data.ctrl[0] = target_rad
+      data.ctrl[tilt_act_id] = target_rad
       mujoco.mj_step(model, data)
-      cur_deg = math.degrees(float(data.qpos[0]))
+      cur_deg = math.degrees(float(data.qpos[tilt_qadr]))
       rel_xy, dt = _rel_pos_and_tilt()
       disp = float(np.linalg.norm(rel_xy - p0_xy))
       if slip_angle_deg is None and disp > slip_thresh:
@@ -2287,32 +2297,48 @@ def run_scenario_5_phased_grasp(
   carrier_id = mujoco.mj_name2id(
       model, int(mujoco.mjtObj.mjOBJ_BODY), "carrier"
   )
+  left_act_id = mujoco.mj_name2id(
+      model, int(mujoco.mjtObj.mjOBJ_ACTUATOR), "act_scenario_left_slide"
+  )
+  right_act_id = mujoco.mj_name2id(
+      model, int(mujoco.mjtObj.mjOBJ_ACTUATOR), "act_scenario_right_slide"
+  )
+  lift_act_id = mujoco.mj_name2id(
+      model, int(mujoco.mjtObj.mjOBJ_ACTUATOR), "act_scenario_lift"
+  )
+  shake_act_id = mujoco.mj_name2id(
+      model, int(mujoco.mjtObj.mjOBJ_ACTUATOR), "act_scenario_shake"
+  )
+  lift_jid = mujoco.mj_name2id(
+      model, int(mujoco.mjtObj.mjOBJ_JOINT), "scenario_lift"
+  )
+  lift_qadr = int(model.jnt_qposadr[lift_jid])
 
   for _ in range(125):
-    data.ctrl[:] = [0.0, 0.0, 0.0, 0.0]
+    data.ctrl[:] = 0.0
     mujoco.mj_step(model, data)
 
   for step in range(200):
     close_cmd = max_close * min(1.0, (step + 1) / 140.0)
-    data.ctrl[0] = close_cmd
-    data.ctrl[1] = close_cmd
-    data.ctrl[2] = 0.0
-    data.ctrl[3] = 0.0
+    data.ctrl[left_act_id] = close_cmd
+    data.ctrl[right_act_id] = close_cmd
+    data.ctrl[lift_act_id] = 0.0
+    data.ctrl[shake_act_id] = 0.0
     mujoco.mj_step(model, data)
 
   z_before_lift = float(data.xpos[carrier_id, 2])
-  wrist_z_before = float(data.qpos[0])
+  wrist_z_before = float(data.qpos[lift_qadr])
 
   for step in range(300):
     lift_cmd = target_lift * min(1.0, (step + 1) / 200.0)
-    data.ctrl[0] = max_close
-    data.ctrl[1] = max_close
-    data.ctrl[2] = lift_cmd
-    data.ctrl[3] = 0.0
+    data.ctrl[left_act_id] = max_close
+    data.ctrl[right_act_id] = max_close
+    data.ctrl[lift_act_id] = lift_cmd
+    data.ctrl[shake_act_id] = 0.0
     mujoco.mj_step(model, data)
 
   z_after_lift = float(data.xpos[carrier_id, 2])
-  wrist_z_after = float(data.qpos[0])
+  wrist_z_after = float(data.qpos[lift_qadr])
   actual_wrist_lift = wrist_z_after - wrist_z_before
   actual_obj_lift = z_after_lift - z_before_lift
   lift_slip_mm = (actual_wrist_lift - actual_obj_lift) * 1000.0
@@ -2334,14 +2360,14 @@ def run_scenario_5_phased_grasp(
   for step in range(375):
     t = step * model.opt.timestep
     shake_cmd = shake_amp * math.sin(2.0 * math.pi * 3.0 * t)
-    data.ctrl[0] = max_close
-    data.ctrl[1] = max_close
-    data.ctrl[2] = target_lift
-    data.ctrl[3] = shake_cmd
+    data.ctrl[left_act_id] = max_close
+    data.ctrl[right_act_id] = max_close
+    data.ctrl[lift_act_id] = target_lift
+    data.ctrl[shake_act_id] = shake_cmd
     mujoco.mj_step(model, data)
 
   z_after_shake = float(data.xpos[carrier_id, 2])
-  wrist_z_after_shake = float(data.qpos[0])
+  wrist_z_after_shake = float(data.qpos[lift_qadr])
   grasp_retained = (z_after_shake - z_before_lift) > (0.45 * target_lift)
   shake_slip_mm = (
       (wrist_z_after_shake - wrist_z_after) - (z_after_shake - z_after_lift)
@@ -2690,9 +2716,12 @@ def run_scenario_7_cliff_ledge_overhang(
   carrier_id = mujoco.mj_name2id(
       model, int(mujoco.mjtObj.mjOBJ_BODY), "carrier"
   )
+  push_act_id = mujoco.mj_name2id(
+      model, int(mujoco.mjtObj.mjOBJ_ACTUATOR), "act_push"
+  )
 
   for _ in range(100):
-    data.ctrl[0] = 0.0
+    data.ctrl[push_act_id] = 0.0
     mujoco.mj_step(model, data)
 
   c_mat0 = np.array(data.xmat[carrier_id], dtype=np.float64).reshape(3, 3)
@@ -2702,7 +2731,7 @@ def run_scenario_7_cliff_ledge_overhang(
   snap_img = None
   total_steps = 700
   for step in range(total_steps):
-    data.ctrl[0] = max_push_dist * (step / total_steps)
+    data.ctrl[push_act_id] = max_push_dist * (step / total_steps)
     mujoco.mj_step(model, data)
 
     v_pts = compute_geom_vertices_world(model, data, vis_ids)
@@ -2845,10 +2874,13 @@ def run_scenario_8_twin_self_stack(
   top_id = mujoco.mj_name2id(
       model, int(mujoco.mjtObj.mjOBJ_BODY), "carrier_top"
   )
+  nudge_act_id = mujoco.mj_name2id(
+      model, int(mujoco.mjtObj.mjOBJ_ACTUATOR), "act_nudge"
+  )
 
   # Settle stack for 250 steps
   for _ in range(250):
-    data.ctrl[0] = 0.0
+    data.ctrl[nudge_act_id] = 0.0
     mujoco.mj_step(model, data)
 
   dz_settled = float(data.xpos[top_id, 2] - data.xpos[bot_id, 2])
@@ -2857,7 +2889,7 @@ def run_scenario_8_twin_self_stack(
   # Gentle sinusoidal table nudge for 250 steps
   for step in range(250):
     t = step * model.opt.timestep
-    data.ctrl[0] = nudge_amp * math.sin(2.0 * math.pi * 2.5 * t)
+    data.ctrl[nudge_act_id] = nudge_amp * math.sin(2.0 * math.pi * 2.5 * t)
     mujoco.mj_step(model, data)
 
   dz_after_nudge = float(data.xpos[top_id, 2] - data.xpos[bot_id, 2])

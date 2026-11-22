@@ -1081,6 +1081,32 @@ def _get_filament_view_and_buf(
   """Returns (or lazily creates) a cached Filament View & RGB target buffer."""
   targets_cache = renderer_bundle["targets_cache"]
   key = (int(vw), int(vh))
+  if renderer_bundle.get("filament_api") == "legacy":
+    # MuJoCo 3.16.0 Filament Renderer registers views on the Renderer and
+    # renders every registered view on `r.render()`, so reuse a single target
+    # ("out_buf") and resize/rebind it whenever the requested resolution changes.
+    if key not in targets_cache:
+      b_arr = np.empty((key[1], key[0], 3), dtype=np.uint8)
+      targets_cache[key] = ("studio_view", b_arr)
+    v_name, b_arr = targets_cache[key]
+    if renderer_bundle.get("active_legacy_size") != key:
+      r = renderer_bundle["renderer"]
+      r.target("out_buf", b_arr)
+      if not renderer_bundle.get("legacy_view_registered", False):
+        r.view(
+            v_name,
+            scene="studio",
+            target="out_buf",
+            headlight=True,
+            headlight_color=(0.96, 0.98, 1.00),
+            headlight_intensity=float(
+                renderer_bundle.get("headlight_intensity", 1400.0)
+            ),
+        )
+        renderer_bundle["legacy_view_registered"] = True
+      renderer_bundle["active_legacy_size"] = key
+    return v_name, b_arr
+
   if key not in targets_cache:
     t_name = "out_buf" if not targets_cache else f"out_buf_{key[0]}x{key[1]}"
     v_obj = filament_renderer.View(
@@ -1116,6 +1142,17 @@ def _create_filament_renderer(
   if use_filament:
     ctx.set_clear_color([0.07, 0.08, 0.11])
     r = filament_renderer.Renderer(ctx)
+    if hasattr(filament_renderer, "View"):
+      filament_api = "views"
+    elif callable(getattr(r, "view", None)) and callable(
+        getattr(r, "update_camera", None)
+    ):
+      filament_api = "legacy"
+    else:
+      raise AttributeError(
+          "Unsupported mujoco.rendering.filament.renderer API: expected"
+          " View or Renderer.view/update_camera"
+      )
     scn = r.scene("studio")
     scn.configure_from_model(model)
     resources = mjrf.ModelResources(ctx, model)
@@ -1123,6 +1160,7 @@ def _create_filament_renderer(
     renderables = mjrf.ModelRenderables(scn, resources)
     bundle: dict[str, Any] = {
         "use_filament": True,
+        "filament_api": filament_api,
         "ctx": ctx,
         "renderer": r,
         "scene": scn,
@@ -1131,6 +1169,8 @@ def _create_filament_renderer(
         "renderables": renderables,
         "headlight_intensity": float(headlight_intensity),
         "targets_cache": targets_cache,
+        "active_legacy_size": None,
+        "legacy_view_registered": False,
         "gl_renderers_cache": gl_renderers_cache,
     }
     if width is not None and height is not None:
@@ -1144,6 +1184,7 @@ def _create_filament_renderer(
     )
   return {
       "use_filament": False,
+      "filament_api": None,
       "ctx": None,
       "renderer": None,
       "scene": None,
@@ -1152,6 +1193,8 @@ def _create_filament_renderer(
       "renderables": None,
       "headlight_intensity": float(headlight_intensity),
       "targets_cache": targets_cache,
+      "active_legacy_size": None,
+      "legacy_view_registered": False,
       "gl_renderers_cache": gl_renderers_cache,
   }
 
@@ -1176,6 +1219,13 @@ def _render_rgb(
       cur_view, cur_buf = _get_filament_view_and_buf(
           renderer_bundle, width, height
       )
+    elif renderer_bundle.get("filament_api") == "legacy":
+      active_size = renderer_bundle.get("active_legacy_size")
+      cur_view, cur_buf = (
+          targets_cache[active_size]
+          if active_size in targets_cache
+          else next(iter(targets_cache.values()))
+      )
     else:
       cur_view, cur_buf = next(iter(targets_cache.values()))
     renderables = renderer_bundle["renderables"]
@@ -1184,8 +1234,13 @@ def _render_rgb(
     renderables.set_options(opt)
     lights.update(data)
     renderables.update(data)
-    cur_view.camera = mujoco.mjv_camera2GLCamera(model, data, vcam)
-    r.render([cur_view])
+    gl_cam = mujoco.mjv_camera2GLCamera(model, data, vcam)
+    if renderer_bundle.get("filament_api") == "legacy":
+      r.update_camera(cur_view, gl_cam)
+      r.render()
+    else:
+      cur_view.camera = gl_cam
+      r.render([cur_view])
     return cur_buf.copy()
 
   gl_cache = renderer_bundle["gl_renderers_cache"]
