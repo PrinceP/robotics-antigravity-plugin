@@ -1,6 +1,6 @@
 # XLeRobot: next approach with Gemini (working notes)
 
-*Status: discussion notes, nothing implemented yet. November 2026.*
+*Status: discussion notes, November 2026. Update 22 Nov: a first version of option 2 runs on the real robot (`xlerobot_gemini_loop.py`, gemini-4-hydrogen); the run reached the sponge in 7 turns, closed beside it, and was stopped by the free-tier quota (20 requests/day). See the [blog update](../blog/xlerobot-sponge-handover/index.md#update-22-nov-closed-loop-with-gemini-4-hydrogen-free-tier).*
 
 Where we are: the sponge handover failed on the real robot (see the [blog post](../blog/xlerobot-sponge-handover/index.md)). The main
 causes were open-loop execution of a precomputed plan, a robot model that did not match our build (arm mounts 11.6 cm higher), uncalibrated
@@ -62,7 +62,8 @@ What we already have for it:
 
 ## Open decisions
 
-- [ ] Gemini API key (option 2) or AI Pro / Ultra (option 1)? A key lives in an environment variable on the machine, never in the repo.
+- [x] Gemini API key (option 2): in `~/.config/gemini/api_key` on the laptop and the Orin, never in the repo. **Free tier: 20
+      gemini-4-hydrogen requests/day, not enough for one full run (~30–45 turns); enable billing.**
 - [ ] Split: the loop on the laptop (model calls, 3D preview, approving moves) with the Orin as a small robot server (moves, camera
       frames, state), close to the web bridge from the first session?
 - [ ] Calibration method and target for the head camera.

@@ -4,12 +4,16 @@
 
 [Background](#background) · [The setup](#the-setup) · [Simulation](#building-the-simulation) · [Sim to real](#from-sim-to-real) ·
 [Runs](#runs) · [Failures](#failures-and-what-each-one-taught-us) · [Compared with the Open Gemini harness](#compared-with-the-open-gemini-4-argon-harness-what-we-missed) ·
-[Next](#what-is-next) · [Credits](#credits)
+[Closed loop with gemini-4-hydrogen](#update-22-nov-closed-loop-with-gemini-4-hydrogen-free-tier) · [Next](#what-is-next) · [Credits](#credits)
 
 **Status: not done.** The goal was a bimanual handover on a MakerMods XLeRobot: the left arm picks a sponge from a desk, hands it to the
 right arm, and the right arm puts it down. We built a MuJoCo model of the robot, ran the task in simulation, derived the sim-to-real joint
 mapping, and ran two attempts on the real robot. Neither real attempt grasped the sponge. This post records what we built, every failure
 with its cause, and what a comparable project that reports success did differently.
+
+**Update, 22 Nov:** a third real attempt replaced the fixed plan with a closed loop driven by `gemini-4-hydrogen`. It reached the
+sponge in 7 turns but closed beside it, and then the Gemini API free tier (20 requests per day) ended the run.
+[Details and video below](#update-22-nov-closed-loop-with-gemini-4-hydrogen-free-tier).
 
 ![Simulation: the left arm picks the sponge and lifts it](media/sim_left_pick_present.gif)
 ![Real robot, second run (timelapse): the left arm reaches over the sponge but stops high above it](media/real_run2_phone_timelapse.gif)
@@ -157,16 +161,58 @@ What we missed, in order of impact:
 4. **Pick the object and grasp for the arm.** With 5 joints the handover must be designed around the heading skew: a narrower object, a
    pose where both headings agree, or a re-grasp.
 
+## Update (22 Nov): closed loop with gemini-4-hydrogen (free tier)
+
+[![Demo: the three camera views, the model's observation, action and result, and the measured arm state per turn](media/hydrogen_free_tier_run_demo_poster.jpg)](media/hydrogen_free_tier_run_demo.mp4)
+
+*[Demo video (1 min)](media/hydrogen_free_tier_run_demo.mp4): head, left wrist and right wrist cameras; the model's observation, plan,
+action and result per turn; the measured arm state; the model's sponge point on the head view (yellow cross); a turn timeline. Waiting
+for the model plays at 12×, robot motion at 1.5×. Tagged "Gemini API free tier · 20 requests/day".*
+
+We ported the idea of the open harness to XLeRobot in
+[`xlerobot_gemini_loop.py`](../../plugins/robotics/skills/xlerobot-sim/scripts/xlerobot_gemini_loop.py) and ran it on the real robot
+with `gemini-4-hydrogen`, called directly through the Gemini API. Each turn the model gets the head and both wrist images plus the
+measured arm state (tool position from forward kinematics, gripper opening and load, a holding flag) and picks **one** skill: `move_to`,
+`nudge` (≤ 3 cm), `roll`, `open`, `close`, `fold`, `look` or `done`. Before any motion the harness solves IK in the `xlerobot-sim` model
+(`--arm-raise 0.116`) and refuses targets that miss by more than 8 mm, leave the workspace, put a jaw tip into the desk, add a MuJoCo
+contact (arm–arm, arm–desk, arm–body) along the move, or leave the calibrated joint range. Refusals go back to the model.
+
+| Turn | Model | Hydrogen chose | Result |
+|---|---|---|---|
+| 1 | 119 s | open left gripper 75 % | opened (but see below: it stalled on its end stop) |
+| 2 | 54 s | `move_to` left, hover 8 cm above the sponge prior, tilt 55° | reached, 3 mm off |
+| 3 | 8 s | nudge back 3 cm, left 2 cm, down 2 cm | reached, 1 mm off |
+| 4 | 19 s | nudge left 2 cm, down 2 cm | reached, 1 mm off |
+| 5 | 13 s | nudge down 2.5 cm (grasp height, 1.5 cm above the desk) | reached, 1 mm off |
+| 6 | 29 s | close | **empty**: the jaws closed fully, load 6 % |
+| 7 | 6 s | lift 3 cm to re-align ("tool point too far forward / right") | reached |
+| 8 | – | – | **HTTP 429**: free-tier daily quota used up; the run stopped, the arm held its pose |
+
+What we learned:
+
+1. **The loop works and every move landed where it was sent** (≤ 3 mm by the joint readings), and the model's corrections went the
+   right way. The model is slow under load: 6–119 s per turn, with HTTP 503 "high demand" retries.
+2. **The grasp missed because the jaws went past the sponge.** In the head view the sponge sat under the wrist, a few cm closer to the
+   robot than the jaws. The wrist camera looks along the gripper and cannot see under its own jaws, so the model read a yellow sliver at
+   the image edge as "between the jaws". Next: each turn, have the model point at the sponge **and** the jaw tips in the head image
+   and report the offset between them, so it moves by a measured offset, not a guess.
+3. **The free tier cannot finish this task.** `gemini-4-hydrogen` allows 20 requests per day on the free tier, and retries count too. A
+   pick, handover and place needs about 30–45 turns, so a full run needs billing on the key's project.
+4. **Opening the gripper to 75 % stalled the servo on its end stop** (99 % load until the close, about 3 minutes; it stayed at 35 °C).
+   The harness now opens to at most 65 % and backs off if the load stays high.
+
+The run's logs (per-turn images, state, model reply, result) and the full-length videos of each camera stay on the robot computer; the
+demo is rendered from them with
+[`xlerobot_gemini_demo_video.py`](../../plugins/robotics/skills/xlerobot-sim/scripts/xlerobot_gemini_demo_video.py).
+
 ## What is next
 
-The next attempt replaces the open-loop plan with a closed loop driven by Gemini. Our plan is to port the open harness to XLeRobot: each
-turn the model sees fresh camera images and robot state and picks one move from a fixed skill menu, and our MuJoCo model checks the move
-before the arms execute it. The comparison of options and the open decisions are in the
-[working notes](../../notes/xlerobot-gemini-next-steps.md). Order of work:
+The closed loop is in place (see the update above); the remaining work follows the
+[working notes](../../notes/xlerobot-gemini-next-steps.md):
 
-1. **Head-camera calibration** to both arm bases (the plugin's `so101-calibration` skill is a starting point). Every later step needs it.
-2. **Port the harness**: our arm driver (`xlerobot_real_plan.py`), the `xlerobot-sim` model with `--arm-raise 0.116` for IK and collision
-   checks, the head camera as the scene camera, and the 5-joint limits reported back as "IK failure".
+1. **Head-camera calibration** to both arm bases (the plugin's `so101-calibration` skill is a starting point), and the model pointing
+   at both the sponge and the jaw tips in the head image each turn, so it corrects by a measured offset.
+2. **Billing on the Gemini key** (a full run needs about 30–45 model calls; the free tier allows 20 per day).
 3. **Single-arm pick and place** of a rigid, narrow object (3–4 cm).
 4. **Handover** with a holding check from gripper position and load on both arms: receiver closes → observe → giver opens only after the
    receiver is confirmed → check again.
@@ -181,6 +227,12 @@ MUJOCO_GL=egl uv run plugins/robotics/skills/xlerobot-sim/scripts/xlerobot_hando
 # robot (XLeRobot host stopped; calibration split per arm): check, then run with checkpoints
 python xlerobot_real_plan.py plan.json --dry
 python xlerobot_real_plan.py plan.json
+
+# closed loop with gemini-4-hydrogen (key in GEMINI_API_KEY or ~/.config/gemini/api_key, never in the repo)
+python xlerobot_gemini_loop.py --dry        # one model turn, no motion
+python xlerobot_gemini_loop.py              # run; Ctrl+C stops, torque stays on
+# laptop: demo video from a copied log folder (rsync -a keeps the file times the timeline uses)
+uv run plugins/robotics/skills/xlerobot-sim/scripts/xlerobot_gemini_demo_video.py logs/gemini_<stamp> --out demo.mp4
 ```
 
 ## Credits

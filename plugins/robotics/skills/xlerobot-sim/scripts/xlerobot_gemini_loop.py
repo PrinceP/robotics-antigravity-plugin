@@ -267,10 +267,20 @@ class Robot:
     return float(np.abs(self.read(arm) - target).max())
 
   def open(self, arm, pct):
+    """Open to pct (max 65 %), then back off while the servo pushes on its end stop: on 2026-11-22 an open to 75 % read 99 % load
+    for minutes (stalled at full torque)."""
     b = self.r[arm].bus
     b.write("Torque_Limit", "gripper", 1000)
-    b.write("Goal_Position", "gripper", float(np.clip(pct, 5, 80)))
+    pct = float(np.clip(pct, 5, 65))
+    b.write("Goal_Position", "gripper", pct)
     time.sleep(0.9)
+    for _ in range(8):
+      if (b.read("Present_Load", "gripper", normalize=False) & 0x3FF) < 500:
+        break
+      pct -= 3
+      b.write("Goal_Position", "gripper", pct)
+      time.sleep(0.3)
+    return pct
 
   def close(self, arm) -> str:
     """Squeeze by load: close in small steps; contact = load high AND the jaw has stopped moving."""
@@ -320,14 +330,14 @@ here). jaws="across" means the jaws close horizontally across the arm's heading 
 width from the desk); jaws="vertical" means the jaws close in the arm's vertical plane. The tool point is where the middle of a
 grasped 6 cm object would be: to grasp the sponge on the desk use tilt_deg 50-55, jaws "across", open the gripper, hover about 6 cm
 above a point about 2.5 cm in from the sponge's end closest to the robot, then descend to h = 0.015 (lower is refused: the jaws would
-touch the desk), then close. The gripper opening is in % (about 70 % = 7.5 cm between jaws).
+touch the desk), then close. The gripper opening is in %: open to at most 65 % (about 7 cm between the jaws); 75 % stalled on the end stop.
 
 SKILLS (pick exactly ONE per turn):
   {{"skill": "move_to", "arm": "left"|"right", "x": m, "y": m, "h": m, "tilt_deg": 30..70, "jaws": "across"|"vertical"}}
       moves the tool point there (straight line when within 10 cm, otherwise a joint move from a fresh IK solution).
   {{"skill": "nudge", "arm": ..., "dx": m, "dy": m, "dh": m}}   small correction, each |d| <= 0.03, keeps the gripper orientation.
   {{"skill": "roll", "arm": ..., "deg": -45..45}}               rotate the wrist roll joint.
-  {{"skill": "open", "arm": ..., "pct": 10..80}}
+  {{"skill": "open", "arm": ..., "pct": 10..65}}
   {{"skill": "close", "arm": ...}}                               squeeze until the jaws stop on an object (load-limited, safe).
   {{"skill": "fold", "arm": ...}}                                move the arm back to its folded rest pose.
   {{"skill": "look"}}                                            do nothing, observe again.
@@ -459,8 +469,8 @@ def main():
     if sk == "look":
       time.sleep(0.5); return "observed"
     if sk == "open":
-      robot.open(arm, float(act.get("pct", 70))); holding[arm] = False
-      return f"{arm} gripper opened to {act.get('pct', 70)} %"
+      got = robot.open(arm, float(act.get("pct", 60))); holding[arm] = False
+      return f"{arm} gripper opened to {got:.0f} %"
     if sk == "close":
       res = robot.close(arm); holding[arm] = res.startswith("jaw stopped")
       return f"{arm} {res}"
