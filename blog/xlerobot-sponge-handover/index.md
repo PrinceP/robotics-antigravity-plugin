@@ -26,7 +26,7 @@ mounts). Earlier we had both arms balancing ping-pong balls at the same time for
 
 This time we used Google DeepMind's [robotics-antigravity-plugin](https://github.com/google-deepmind/robotics-antigravity-plugin): agent
 skills for robot bring-up, perception, planning and sim-to-real, built around MuJoCo. It has no XLeRobot support, so we added an
-`xlerobot-sim` skill on this fork. A closely related project, the
+`xlerobot-sim` skill on this fork (kept up to date with upstream `main`; currently plugin version 0.1.12). A closely related project, the
 [Open Gemini 4 Argon Robot Harness](https://ehehee.github.io/blog/open-gemini-harness/), reports a zero-shot bimanual handover on two YAM arms;
 we compare against it at the end.
 
@@ -159,12 +159,18 @@ What we missed, in order of impact:
 
 ## What is next
 
-1. Re-plan with `--arm-raise 0.116` (our measured mounts) and re-tune the grasp at the new height.
-2. Hand-eye calibration of the head camera (the plugin's `so101-calibration` skill is a starting point) and a closed-loop "hover, look,
-   correct" step before every grasp.
-3. Holding check from gripper position and load on both arms; the giver opens only after the receiver is confirmed.
-4. A narrower object first (3–4 cm), then the sponge.
-5. A deformable sponge in simulation (MuJoCo `flexcomp`) to replace the grasp attach.
+The next attempt replaces the open-loop plan with a closed loop driven by Gemini. Our plan is to port the open harness to XLeRobot: each
+turn the model sees fresh camera images and robot state and picks one move from a fixed skill menu, and our MuJoCo model checks the move
+before the arms execute it. The comparison of options and the open decisions are in the
+[working notes](../../notes/xlerobot-gemini-next-steps.md). Order of work:
+
+1. **Head-camera calibration** to both arm bases (the plugin's `so101-calibration` skill is a starting point). Every later step needs it.
+2. **Port the harness**: our arm driver (`xlerobot_real_plan.py`), the `xlerobot-sim` model with `--arm-raise 0.116` for IK and collision
+   checks, the head camera as the scene camera, and the 5-joint limits reported back as "IK failure".
+3. **Single-arm pick and place** of a rigid, narrow object (3–4 cm).
+4. **Handover** with a holding check from gripper position and load on both arms: receiver closes → observe → giver opens only after the
+   receiver is confirmed → check again.
+5. **The sponge** last, with a deformable sponge in simulation (MuJoCo `flexcomp`) to replace the grasp attach.
 
 ## Reproduce
 
@@ -180,7 +186,7 @@ python xlerobot_real_plan.py plan.json
 ## Credits
 
 - [google-deepmind/robotics-antigravity-plugin](https://github.com/google-deepmind/robotics-antigravity-plugin) (Apache-2.0), which this
-  fork extends.
+  fork extends (merged up to upstream `main` at plugin version 0.1.12).
 - MakerMods XLeRobot URDF and meshes (Apache-2.0), published with the [MakerMods XLeRobot project on tnkr.ai](https://tnkr.ai/ryans-workspace/xlerobot);
   [MakerMods-XLeRobot](https://github.com/makermods-robotics/MakerMods-XLeRobot) print files (MIT).
 - [XLeRobot](https://github.com/Vector-Wangel/XLeRobot) (Apache-2.0) and its [documentation](https://xlerobot.readthedocs.io).
