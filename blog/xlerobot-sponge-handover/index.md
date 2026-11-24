@@ -2,6 +2,8 @@
 
 *A robotics case study · November 2026 · Prince Patel, with Claude Code · code: [`plugins/robotics/skills/xlerobot-sim`](../../plugins/robotics/skills/xlerobot-sim)*
 
+Published with the demo videos inline: **[princep.github.io/blogs/2026-11-24-XLeRobot-Sponge-Handover-Gemini](https://princep.github.io/blogs/2026-11-24-XLeRobot-Sponge-Handover-Gemini/)** (source: `index.html` in this folder).
+
 [Background](#background) · [The setup](#the-setup) · [Simulation](#building-the-simulation) · [Sim to real](#from-sim-to-real) ·
 [Runs](#runs) · [Failures](#failures-and-what-each-one-taught-us) · [Compared with the Open Gemini harness](#compared-with-the-open-gemini-4-argon-harness-what-we-missed) ·
 [Closed loop with gemini-4-hydrogen](#update-22-nov-closed-loop-with-gemini-4-hydrogen-free-tier) · [Next](#what-is-next) · [Credits](#credits)
